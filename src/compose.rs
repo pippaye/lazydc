@@ -204,6 +204,10 @@ fn build_compose_command_owned(
         args.push(OsString::from("--env-file"));
         args.push(config.env_file().into_os_string());
     }
+    if let Some(project_env) = &project.env_file {
+        args.push(OsString::from("--env-file"));
+        args.push(project_env.clone().into_os_string());
+    }
     args.push(OsString::from("--project-name"));
     args.push(OsString::from(project.name.clone()));
     args.push(OsString::from("-f"));
@@ -308,7 +312,9 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::project::Project;
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::tempdir;
 
     fn sample_config() -> AppConfig {
         AppConfig {
@@ -349,5 +355,42 @@ mod tests {
         assert!(command
             .display
             .contains("down -v --remove-orphans --rmi all"));
+    }
+
+    #[test]
+    fn compose_command_includes_global_and_project_env_files() {
+        let dir = tempdir().unwrap();
+        let compose_dir = dir.path().join("compose");
+        let project_dir = compose_dir.join("app");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(compose_dir.join(".env.global"), "GLOBAL=1\n").unwrap();
+        fs::write(project_dir.join(".env"), "PROJECT=1\n").unwrap();
+        fs::write(project_dir.join("docker-compose.yaml"), "services: {}\n").unwrap();
+
+        let config = AppConfig {
+            compose_dir: compose_dir.clone(),
+            docker_bin: PathBuf::from("docker"),
+            refresh_interval_ms: 2000,
+            default_log_lines: 50,
+        };
+        let project = Project {
+            name: "app".to_string(),
+            dir: project_dir.clone(),
+            compose_file: project_dir.join("docker-compose.yaml"),
+            env_file: Some(project_dir.join(".env")),
+        };
+
+        let command = Action::Deploy
+            .prepare_commands(&config, &project)
+            .pop()
+            .unwrap();
+        assert!(command.display.contains(&format!(
+            "--env-file {}",
+            compose_dir.join(".env.global").display()
+        )));
+        assert!(command.display.contains(&format!(
+            "--env-file {}",
+            project_dir.join(".env").display()
+        )));
     }
 }
