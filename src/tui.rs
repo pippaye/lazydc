@@ -76,6 +76,12 @@ enum InputMode {
     Filter,
 }
 
+#[derive(Debug, Clone)]
+struct PendingAction {
+    label: &'static str,
+    action: Action,
+}
+
 #[derive(Debug)]
 enum TuiEvent {
     StatusesLoaded(Vec<ProjectStatus>),
@@ -113,6 +119,7 @@ struct App {
     status_message: String,
     last_command: Option<String>,
     show_help: bool,
+    pending_action: Option<PendingAction>,
 }
 
 impl App {
@@ -133,6 +140,7 @@ impl App {
             status_message: "Loading project status...".to_string(),
             last_command: None,
             show_help: false,
+            pending_action: None,
         }
     }
 
@@ -141,6 +149,21 @@ impl App {
             match key.code {
                 KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => {
                     self.show_help = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
+
+        if let Some(pending) = self.pending_action.clone() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.pending_action = None;
+                    self.spawn_action(pending.action, tx);
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                    self.pending_action = None;
+                    self.status_message = format!("{} cancelled", pending.label);
                 }
                 _ => {}
             }
@@ -161,18 +184,28 @@ impl App {
             KeyCode::PageDown => self.scroll_active(5),
             KeyCode::PageUp => self.scroll_active(-5),
             KeyCode::Enter => self.focus = Focus::Details,
+            KeyCode::Char('a') => self.toggle_select_all_visible(),
+            KeyCode::Char('A') => self.invert_visible_selection(),
             KeyCode::Char(' ') if self.focus == Focus::Projects => self.toggle_mark(),
-            KeyCode::Char('u') if !self.command_running => self.spawn_action(Action::Deploy, tx),
-            KeyCode::Char('U') if !self.command_running => self.spawn_action(Action::Update, tx),
-            KeyCode::Char('s') if !self.command_running => self.spawn_action(Action::Stop, tx),
-            KeyCode::Char('r') if !self.command_running => self.spawn_action(Action::Restart, tx),
-            KeyCode::Char('d') if !self.command_running => self.spawn_action(
+            KeyCode::Char('u') if !self.command_running => {
+                self.confirm_action("deploy", Action::Deploy)
+            }
+            KeyCode::Char('U') if !self.command_running => {
+                self.confirm_action("update", Action::Update)
+            }
+            KeyCode::Char('s') if !self.command_running => {
+                self.confirm_action("stop", Action::Stop)
+            }
+            KeyCode::Char('r') if !self.command_running => {
+                self.confirm_action("restart", Action::Restart)
+            }
+            KeyCode::Char('d') if !self.command_running => self.confirm_action(
+                "remove",
                 Action::Remove(RemoveOptions {
                     volumes: false,
                     remove_orphans: false,
                     rmi: None,
                 }),
-                tx,
             ),
             KeyCode::Char('l') if !self.command_running => self.spawn_action(
                 Action::Logs(LogsOptions {
@@ -290,6 +323,17 @@ impl App {
         });
     }
 
+    fn confirm_action(&mut self, label: &'static str, action: Action) {
+        let count = self.selected_projects().len();
+        if count == 0 {
+            self.status_message = "No project selected".to_string();
+            return;
+        }
+
+        self.pending_action = Some(PendingAction { label, action });
+        self.status_message = format!("Confirm {label} for {count} project(s)");
+    }
+
     fn selected_projects(&self) -> Vec<Project> {
         if !self.marked.is_empty() {
             return self
@@ -319,6 +363,13 @@ impl App {
             .iter()
             .map(|status| &status.project.name)
             .filter(|name| self.filter.is_empty() || name.contains(&self.filter))
+            .collect()
+    }
+
+    fn visible_project_names(&self) -> Vec<String> {
+        self.visible_statuses()
+            .into_iter()
+            .map(|name| name.clone())
             .collect()
     }
 
@@ -372,6 +423,41 @@ impl App {
                 self.marked.remove(&name);
             }
         }
+    }
+
+    fn toggle_select_all_visible(&mut self) {
+        let visible = self.visible_project_names();
+        if visible.is_empty() {
+            self.status_message = "No visible projects".to_string();
+            return;
+        }
+
+        if visible.iter().all(|name| self.marked.contains(name)) {
+            for name in &visible {
+                self.marked.remove(name);
+            }
+            self.status_message = format!("Cleared {} visible project(s)", visible.len());
+        } else {
+            for name in &visible {
+                self.marked.insert(name.clone());
+            }
+            self.status_message = format!("Selected {} visible project(s)", visible.len());
+        }
+    }
+
+    fn invert_visible_selection(&mut self) {
+        let visible = self.visible_project_names();
+        if visible.is_empty() {
+            self.status_message = "No visible projects".to_string();
+            return;
+        }
+
+        for name in &visible {
+            if !self.marked.insert(name.clone()) {
+                self.marked.remove(name);
+            }
+        }
+        self.status_message = format!("Inverted {} visible project(s)", visible.len());
     }
 
     fn push_output(&mut self, line: String, stderr: bool) {
@@ -428,6 +514,10 @@ fn draw(frame: &mut Frame, app: &App) {
 
     if app.show_help {
         draw_help(frame);
+    }
+
+    if app.pending_action.is_some() {
+        draw_confirmation(frame, app);
     }
 }
 
@@ -600,14 +690,16 @@ fn draw_help(frame: &mut Frame) {
         Line::from(""),
         Line::from("Selection"),
         Line::from("  Space                Mark or unmark project"),
+        Line::from("  a                    Select all visible projects, or clear if all visible are selected"),
+        Line::from("  A                    Invert visible project selection"),
         Line::from("  /                    Filter projects"),
         Line::from(""),
         Line::from("Actions"),
-        Line::from("  u                    Deploy"),
-        Line::from("  U                    Update"),
-        Line::from("  s                    Stop"),
-        Line::from("  r                    Restart"),
-        Line::from("  d                    Remove"),
+        Line::from("  u                    Deploy, with confirmation"),
+        Line::from("  U                    Update, with confirmation"),
+        Line::from("  s                    Stop, with confirmation"),
+        Line::from("  r                    Restart, with confirmation"),
+        Line::from("  d                    Remove, with confirmation"),
         Line::from("  l                    Show logs"),
         Line::from(""),
         Line::from("General"),
@@ -627,6 +719,39 @@ fn draw_help(frame: &mut Frame) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(help, area);
+}
+
+fn draw_confirmation(frame: &mut Frame, app: &App) {
+    let Some(pending) = &app.pending_action else {
+        return;
+    };
+
+    let count = app.selected_projects().len();
+    let area = centered_rect(frame.area(), 56, 24);
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Confirm Action",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(format!("Run {} for {} project(s)?", pending.label, count)),
+        Line::from(""),
+        Line::from("Enter / y   confirm"),
+        Line::from("Esc / n / q cancel"),
+    ];
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Confirmation")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black))
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(modal, area);
 }
 
 fn status_style(state: ProjectState) -> Style {
