@@ -5,11 +5,14 @@ use bollard::container::{
 };
 use bollard::models::{ContainerInspectResponse, ContainerSummary, Port};
 use bollard::Docker;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::project::Project;
+
+const PROJECT_STATUS_CONCURRENCY: usize = 4;
+const CONTAINER_INSPECT_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectStatus {
@@ -122,26 +125,37 @@ impl ProjectSummary {
 pub async fn load_statuses_for_projects(projects: &[Project]) -> Vec<ProjectStatus> {
     match Docker::connect_with_local_defaults() {
         Ok(docker) => {
-            let mut statuses = Vec::with_capacity(projects.len());
-            for project in projects {
-                let status = match load_project_status(&docker, project).await {
-                    Ok(status) => status,
-                    Err(err) => ProjectStatus {
-                        project: project.clone(),
-                        summary: ProjectSummary {
-                            state: ProjectState::Error,
-                            health: HealthSummary::Unknown,
-                            running_containers: 0,
-                            total_containers: 0,
-                            metrics: None,
-                        },
-                        containers: Vec::new(),
-                        error: Some(err.to_string()),
-                    },
-                };
-                statuses.push(status);
-            }
+            let mut statuses = stream::iter(projects.iter().cloned().enumerate())
+                .map(|(index, project)| {
+                    let docker = &docker;
+                    async move {
+                        let status = match load_project_status(docker, &project).await {
+                            Ok(status) => status,
+                            Err(err) => ProjectStatus {
+                                project: project.clone(),
+                                summary: ProjectSummary {
+                                    state: ProjectState::Error,
+                                    health: HealthSummary::Unknown,
+                                    running_containers: 0,
+                                    total_containers: 0,
+                                    metrics: None,
+                                },
+                                containers: Vec::new(),
+                                error: Some(err.to_string()),
+                            },
+                        };
+                        (index, status)
+                    }
+                })
+                .buffer_unordered(PROJECT_STATUS_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+
+            statuses.sort_by_key(|(index, _)| *index);
             statuses
+                .into_iter()
+                .map(|(_, status)| status)
+                .collect::<Vec<_>>()
         }
         Err(err) => projects
             .iter()
@@ -176,10 +190,21 @@ async fn load_project_status(docker: &Docker, project: &Project) -> Result<Proje
         .await
         .with_context(|| format!("failed to list containers for {}", project.name))?;
 
-    let mut container_statuses = Vec::with_capacity(containers.len());
-    for container in containers {
-        container_statuses.push(inspect_container(docker, container).await?);
-    }
+    let mut container_statuses = stream::iter(containers.into_iter().enumerate())
+        .map(|(index, container)| async move {
+            inspect_container(docker, container)
+                .await
+                .map(|status| (index, status))
+        })
+        .buffer_unordered(CONTAINER_INSPECT_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    container_statuses.sort_by_key(|(index, _)| *index);
+    let container_statuses = container_statuses
+        .into_iter()
+        .map(|(_, status)| status)
+        .collect::<Vec<_>>();
 
     let summary = summarize_project(&container_statuses);
     Ok(ProjectStatus {
@@ -236,7 +261,7 @@ async fn load_container_metrics(docker: &Docker, container_id: &str) -> Result<C
         container_id,
         Some(StatsOptions {
             stream: false,
-            one_shot: false,
+            one_shot: true,
         }),
     );
 

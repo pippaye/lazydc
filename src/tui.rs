@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::{BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
@@ -17,7 +19,7 @@ use crate::config::AppConfig;
 use crate::docker_api::{
     self, ContainerMetrics, HealthSummary, ProjectMetrics, ProjectState, ProjectStatus,
 };
-use crate::project::{discover_projects, Project};
+use crate::project::{create_project, discover_projects, validate_project_name, Project};
 
 const OUTPUT_LIMIT: usize = 2_000;
 
@@ -42,8 +44,35 @@ async fn run_tui_inner(mut terminal: DefaultTerminal, config: AppConfig) -> Resu
         tokio::select! {
             maybe_event = reader.next() => {
                 if let Some(Ok(Event::Key(key))) = maybe_event {
-                    if !app.handle_key(key, tx.clone()) {
-                        break;
+                    match app.handle_key(key, tx.clone()) {
+                        KeyOutcome::Continue => {}
+                        KeyOutcome::Quit => break,
+                        KeyOutcome::OpenEditor(launch) => {
+                            terminal.draw(|frame| draw(frame, &app))?;
+                            let result = suspend_for_editor(&mut terminal, &launch);
+                            reader = EventStream::new();
+                            app.refresh_inflight = false;
+                            match result {
+                                Ok(()) => {
+                                    app.status_message = format!("Created project {}", launch.project_name);
+                                    app.push_output(
+                                        format!("Created project {} at {}", launch.project_name, launch.compose_file.display()),
+                                        false,
+                                    );
+                                }
+                                Err(err) => {
+                                    app.status_message = format!(
+                                        "Project {} created, editor failed: {err}",
+                                        launch.project_name
+                                    );
+                                    app.push_output(
+                                        format!("Editor failed for {}: {err}", launch.project_name),
+                                        true,
+                                    );
+                                }
+                            }
+                            app.refresh(tx.clone());
+                        }
                     }
                 }
             }
@@ -76,12 +105,27 @@ enum Focus {
 enum InputMode {
     Normal,
     Filter,
+    NewProject,
 }
 
 #[derive(Debug, Clone)]
 struct PendingAction {
     label: &'static str,
     action: Action,
+}
+
+#[derive(Debug)]
+enum KeyOutcome {
+    Continue,
+    Quit,
+    OpenEditor(EditorLaunch),
+}
+
+#[derive(Debug)]
+struct EditorLaunch {
+    editor: String,
+    project_name: String,
+    compose_file: PathBuf,
 }
 
 #[derive(Debug)]
@@ -122,6 +166,8 @@ struct App {
     last_command: Option<String>,
     show_help: bool,
     pending_action: Option<PendingAction>,
+    new_project_name: String,
+    new_project_error: Option<String>,
 }
 
 impl App {
@@ -143,10 +189,12 @@ impl App {
             last_command: None,
             show_help: false,
             pending_action: None,
+            new_project_name: String::new(),
+            new_project_error: None,
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent, tx: mpsc::UnboundedSender<TuiEvent>) -> bool {
+    fn handle_key(&mut self, key: KeyEvent, tx: mpsc::UnboundedSender<TuiEvent>) -> KeyOutcome {
         if self.show_help {
             match key.code {
                 KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => {
@@ -154,7 +202,7 @@ impl App {
                 }
                 _ => {}
             }
-            return true;
+            return KeyOutcome::Continue;
         }
 
         if let Some(pending) = self.pending_action.clone() {
@@ -169,18 +217,24 @@ impl App {
                 }
                 _ => {}
             }
-            return true;
+            return KeyOutcome::Continue;
         }
 
         if self.input_mode == InputMode::Filter {
-            return self.handle_filter_key(key);
+            self.handle_filter_key(key);
+            return KeyOutcome::Continue;
+        }
+
+        if self.input_mode == InputMode::NewProject {
+            return self.handle_new_project_key(key);
         }
 
         match key.code {
-            KeyCode::Char('q') => return false,
+            KeyCode::Char('q') => return KeyOutcome::Quit,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Tab => self.focus = next_focus(self.focus),
             KeyCode::Char('/') => self.input_mode = InputMode::Filter,
+            KeyCode::Char('n') if !self.command_running => self.start_new_project(),
             KeyCode::Char('j') | KeyCode::Down => self.move_down(),
             KeyCode::Char('k') | KeyCode::Up => self.move_up(),
             KeyCode::PageDown => self.scroll_active(5),
@@ -218,10 +272,10 @@ impl App {
             ),
             _ => {}
         }
-        true
+        KeyOutcome::Continue
     }
 
-    fn handle_filter_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_filter_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => self.input_mode = InputMode::Normal,
             KeyCode::Backspace => {
@@ -234,7 +288,85 @@ impl App {
             }
             _ => {}
         }
-        true
+    }
+
+    fn handle_new_project_key(&mut self, key: KeyEvent) -> KeyOutcome {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.new_project_name.clear();
+                self.new_project_error = None;
+                self.status_message = "New project cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                if let Some(launch) = self.submit_new_project() {
+                    return KeyOutcome::OpenEditor(launch);
+                }
+            }
+            KeyCode::Backspace => {
+                self.new_project_name.pop();
+                self.new_project_error = None;
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.new_project_name.push(ch);
+                self.new_project_error = None;
+            }
+            _ => {}
+        }
+
+        KeyOutcome::Continue
+    }
+
+    fn start_new_project(&mut self) {
+        self.input_mode = InputMode::NewProject;
+        self.new_project_name.clear();
+        self.new_project_error = None;
+        self.status_message = "Enter new project name".to_string();
+    }
+
+    fn submit_new_project(&mut self) -> Option<EditorLaunch> {
+        self.submit_new_project_with_editor(configured_editor())
+    }
+
+    fn submit_new_project_with_editor(&mut self, editor: Option<String>) -> Option<EditorLaunch> {
+        let name = self.new_project_name.clone();
+        if let Err(err) = validate_project_name(&name) {
+            self.new_project_error = Some(err.to_string());
+            self.status_message = err.to_string();
+            return None;
+        }
+
+        let editor = match editor {
+            Some(editor) => editor,
+            None => {
+                let message = "set VISUAL or EDITOR to create projects".to_string();
+                self.input_mode = InputMode::Normal;
+                self.new_project_name.clear();
+                self.new_project_error = None;
+                self.status_message = message;
+                return None;
+            }
+        };
+
+        let project = match create_project(&self.config.compose_dir, &name) {
+            Ok(project) => project,
+            Err(err) => {
+                self.new_project_error = Some(err.to_string());
+                self.status_message = err.to_string();
+                return None;
+            }
+        };
+
+        self.input_mode = InputMode::Normal;
+        self.new_project_name.clear();
+        self.new_project_error = None;
+        self.status_message = format!("Opening editor for {}", project.name);
+
+        Some(EditorLaunch {
+            editor,
+            project_name: project.name,
+            compose_file: project.compose_file,
+        })
     }
 
     fn handle_event(&mut self, event: TuiEvent) {
@@ -521,6 +653,10 @@ fn draw(frame: &mut Frame, app: &App) {
     if app.pending_action.is_some() {
         draw_confirmation(frame, app);
     }
+
+    if app.input_mode == InputMode::NewProject {
+        draw_new_project(frame, app);
+    }
 }
 
 fn draw_projects(frame: &mut Frame, app: &App, area: Rect) {
@@ -758,6 +894,45 @@ fn draw_confirmation(frame: &mut Frame, app: &App) {
     frame.render_widget(modal, area);
 }
 
+fn draw_new_project(frame: &mut Frame, app: &App) {
+    let area = centered_rect(frame.area(), 60, 28);
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "New Project",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(format!("Name: {}", app.new_project_name)),
+        Line::from(""),
+    ];
+
+    if let Some(error) = &app.new_project_error {
+        lines.push(Line::from(Span::styled(
+            format!("Error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from("Allowed: lowercase letters, digits, - and _"));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Enter create and edit"));
+    lines.push(Line::from("Esc cancel"));
+
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("New Project")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black))
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(modal, area);
+}
+
 fn status_style(state: ProjectState) -> Style {
     match state {
         ProjectState::Running => Style::default().fg(Color::Green),
@@ -988,4 +1163,124 @@ fn format_failures(failures: &[ProjectFailure]) -> String {
         .map(|failure| format!("{}: {}", failure.project, failure.message))
         .collect::<Vec<_>>()
         .join(" | ")
+}
+
+fn configured_editor() -> Option<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn suspend_for_editor(terminal: &mut DefaultTerminal, launch: &EditorLaunch) -> Result<()> {
+    ratatui::try_restore().context("failed to suspend TUI for editor")?;
+    let editor_result = run_editor(&launch.editor, &launch.compose_file);
+    let restore_result = ratatui::try_init()
+        .map(|new_terminal| {
+            *terminal = new_terminal;
+        })
+        .context("failed to restore TUI after editor");
+
+    match (editor_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(editor_err), Ok(())) => Err(editor_err),
+        (Ok(()), Err(restore_err)) => Err(restore_err),
+        (Err(editor_err), Err(restore_err)) => Err(anyhow!(
+            "{editor_err}; additionally failed to restore TUI after editor: {restore_err}"
+        )),
+    }
+}
+
+fn run_editor(editor: &str, path: &Path) -> Result<()> {
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("exec {editor} \"$1\""))
+        .arg("lazydc-editor")
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to launch editor {editor}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "editor exited with {}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            compose_dir: PathBuf::from("/tmp/lazydc-test"),
+            docker_bin: PathBuf::from("docker"),
+            refresh_interval_ms: 2_000,
+            default_log_lines: 100,
+        }
+    }
+
+    #[test]
+    fn n_enters_new_project_input_mode() {
+        let mut app = App::new(test_config());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), tx);
+
+        assert!(matches!(outcome, KeyOutcome::Continue));
+        assert_eq!(app.input_mode, InputMode::NewProject);
+        assert_eq!(app.new_project_name, "");
+    }
+
+    #[test]
+    fn esc_cancels_new_project_input() {
+        let mut app = App::new(test_config());
+        app.start_new_project();
+        app.new_project_name = "app".to_string();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), tx);
+
+        assert!(matches!(outcome, KeyOutcome::Continue));
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.new_project_name, "");
+        assert!(app.new_project_error.is_none());
+    }
+
+    #[test]
+    fn enter_with_invalid_name_stays_in_new_project_input() {
+        let mut app = App::new(test_config());
+        app.start_new_project();
+        app.new_project_name = "App".to_string();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), tx);
+
+        assert!(matches!(outcome, KeyOutcome::Continue));
+        assert_eq!(app.input_mode, InputMode::NewProject);
+        assert!(app.new_project_error.is_some());
+    }
+
+    #[test]
+    fn enter_without_editor_exits_new_project_input() {
+        let mut app = App::new(test_config());
+        app.start_new_project();
+        app.new_project_name = "app".to_string();
+        let launch = app.submit_new_project_with_editor(None);
+
+        assert!(launch.is_none());
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert_eq!(app.new_project_name, "");
+        assert!(app.status_message.contains("VISUAL or EDITOR"));
+    }
 }

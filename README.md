@@ -203,6 +203,7 @@ Keyboard shortcuts:
 - `Space`: mark or unmark a project
 - `/`: filter projects
 - `PageUp` / `PageDown`: scroll details or output
+- `n`: create a new project
 - `u`: deploy
 - `U`: update
 - `s`: stop
@@ -213,6 +214,8 @@ Keyboard shortcuts:
 - `q`: quit
 
 If multiple projects are marked, actions run against the marked set in sequence. Otherwise the action targets the currently selected project.
+
+New project creation is available from the TUI with `n`. It creates `<compose-dir>/<name>/docker-compose.yaml` with a minimal `services: {}` file, then opens the file in `$VISUAL` or `$EDITOR`. Project names follow Docker Compose project name rules: lowercase letters, digits, `-`, and `_`, starting with a lowercase letter or digit.
 
 ## Build and Run
 

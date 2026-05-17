@@ -1,6 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const COMPOSE_FILES: &[&str] = &[
@@ -52,6 +53,60 @@ pub fn discover_projects(compose_dir: &Path) -> Result<Vec<Project>> {
     Ok(projects)
 }
 
+pub fn create_project(compose_dir: &Path, name: &str) -> Result<Project> {
+    validate_project_name(name)?;
+
+    fs::create_dir_all(compose_dir)
+        .with_context(|| format!("failed to create compose dir {}", compose_dir.display()))?;
+
+    let dir = compose_dir.join(name);
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(anyhow!("project path already exists: {}", dir.display()));
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to create project dir {}", dir.display()));
+        }
+    }
+
+    let compose_file = dir.join("docker-compose.yaml");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&compose_file)
+        .with_context(|| format!("failed to create compose file {}", compose_file.display()))?;
+    file.write_all(b"services: {}\n")
+        .with_context(|| format!("failed to write compose file {}", compose_file.display()))?;
+
+    Ok(Project {
+        name: name.to_string(),
+        dir,
+        compose_file,
+        env_file: None,
+    })
+}
+
+pub fn validate_project_name(name: &str) -> Result<()> {
+    let Some(first) = name.chars().next() else {
+        bail!("project name cannot be empty");
+    };
+
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        bail!("project name must start with a lowercase letter or digit");
+    }
+
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+    {
+        bail!("project name can contain only lowercase letters, digits, '-' and '_'");
+    }
+
+    Ok(())
+}
+
 fn find_compose_file(dir: &Path) -> Option<PathBuf> {
     COMPOSE_FILES
         .iter()
@@ -76,5 +131,65 @@ mod tests {
         let projects = discover_projects(dir.path()).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "app");
+    }
+
+    #[test]
+    fn validates_compose_project_names() {
+        for name in ["app", "app-1", "app_1", "1app"] {
+            validate_project_name(name).unwrap();
+        }
+
+        for name in [
+            "",
+            "App",
+            "-app",
+            "_app",
+            "app.name",
+            "app/name",
+            "app name",
+            "\u{5e94}\u{7528}",
+        ] {
+            assert!(validate_project_name(name).is_err(), "{name} should fail");
+        }
+    }
+
+    #[test]
+    fn creates_project_with_minimal_compose_file() {
+        let dir = tempdir().unwrap();
+        let project = create_project(dir.path(), "app").unwrap();
+
+        assert_eq!(project.name, "app");
+        assert_eq!(project.dir, dir.path().join("app"));
+        assert_eq!(
+            project.compose_file,
+            dir.path().join("app/docker-compose.yaml")
+        );
+        assert_eq!(project.env_file, None);
+        assert_eq!(
+            fs::read_to_string(project.compose_file).unwrap(),
+            "services: {}\n"
+        );
+    }
+
+    #[test]
+    fn creates_missing_compose_dir() {
+        let dir = tempdir().unwrap();
+        let compose_dir = dir.path().join("compose-root");
+
+        create_project(&compose_dir, "app").unwrap();
+
+        assert!(compose_dir.join("app/docker-compose.yaml").exists());
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_project_path() {
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path().join("app");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let err = create_project(dir.path(), "app").unwrap_err();
+
+        assert!(err.to_string().contains("already exists"));
+        assert!(!project_dir.join("docker-compose.yaml").exists());
     }
 }
