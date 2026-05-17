@@ -61,7 +61,7 @@ Notes:
 
 - Read-only operations:
   - project discovery from the filesystem
-  - container state, health, port mapping, and start time from Docker API
+  - container state, health, resource metrics, port mapping, and start time from Docker API
 - Mutating operations:
   - `deploy`
   - `update`
@@ -174,15 +174,18 @@ The project list shows:
 - project state
 - health summary
 - running container summary like `3/4 running`
+- project CPU and memory metrics when available
 
 The details panel shows:
 
 - project path
 - compose file path
+- project-level CPU, memory, network I/O, block I/O, and PID metrics
 - container names
 - image
 - state
 - health status
+- container-level CPU, memory, network I/O, block I/O, and PID metrics
 - ports
 - start time
 

@@ -10,6 +10,7 @@ use clap::Parser;
 use cli::{Cli, Commands, TargetArgs};
 use compose::{Action, ActionBatchResult, CliOutputSink};
 use config::AppConfig;
+use docker_api::ProjectMetrics;
 use project::{discover_projects, Project};
 use std::collections::BTreeSet;
 
@@ -71,15 +72,57 @@ async fn run_status(config: &AppConfig, target_args: TargetArgs, json: bool) -> 
     }
 
     for status in statuses {
+        let metrics = status.summary.metrics.as_ref();
         println!(
-            "{:<20} {:<8} {:<16} {}",
+            "{:<20} {:<8} {:<16} {:<13} cpu {:<7} mem {:<24} net {:<17} block {:<17} pids {}",
             status.project.name,
             status.summary.state_label(),
             status.summary.health_label(),
-            status.summary.running_summary()
+            status.summary.running_summary(),
+            format_metric_cpu(metrics),
+            format_metric_memory(metrics),
+            format_metric_net(metrics),
+            format_metric_block(metrics),
+            format_metric_pids(metrics)
         );
     }
     Ok(())
+}
+
+fn format_metric_cpu(metrics: Option<&ProjectMetrics>) -> String {
+    metrics
+        .map(|metrics| docker_api::format_cpu(metrics.cpu_percent))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_metric_memory(metrics: Option<&ProjectMetrics>) -> String {
+    metrics
+        .map(|metrics| {
+            docker_api::format_memory(
+                metrics.memory_usage_bytes,
+                metrics.memory_limit_bytes,
+                metrics.memory_percent,
+            )
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_metric_net(metrics: Option<&ProjectMetrics>) -> String {
+    metrics
+        .map(|metrics| docker_api::format_io(metrics.network_rx_bytes, metrics.network_tx_bytes))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_metric_block(metrics: Option<&ProjectMetrics>) -> String {
+    metrics
+        .map(|metrics| docker_api::format_io(metrics.block_read_bytes, metrics.block_write_bytes))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_metric_pids(metrics: Option<&ProjectMetrics>) -> String {
+    metrics
+        .map(|metrics| docker_api::format_pids(metrics.pids))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 async fn run_action(config: &AppConfig, target_args: TargetArgs, action: Action) -> Result<()> {

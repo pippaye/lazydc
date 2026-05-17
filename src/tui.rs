@@ -14,7 +14,9 @@ use crate::compose::{
     self, Action, ActionBatchResult, LogsOptions, OutputSink, ProjectFailure, RemoveOptions,
 };
 use crate::config::AppConfig;
-use crate::docker_api::{self, ProjectState, ProjectStatus};
+use crate::docker_api::{
+    self, ContainerMetrics, HealthSummary, ProjectMetrics, ProjectState, ProjectStatus,
+};
 use crate::project::{discover_projects, Project};
 
 const OUTPUT_LIMIT: usize = 2_000;
@@ -523,6 +525,7 @@ fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_projects(frame: &mut Frame, app: &App, area: Rect) {
     let visible = app.visible_statuses();
+    let inner_width = area.width.saturating_sub(2) as usize;
     let items = visible
         .iter()
         .map(|name| {
@@ -531,14 +534,7 @@ fn draw_projects(frame: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .find(|status| &status.project.name == *name)
                 .expect("status exists");
-            let mark = if app.marked.contains(*name) { "*" } else { " " };
-            let line = format!(
-                "[{mark}] {:<16} {:<8} {:<14} {}",
-                status.project.name,
-                status.summary.state_label(),
-                status.summary.health_label(),
-                status.summary.running_summary()
-            );
+            let line = project_list_line(status, app.marked.contains(*name), inner_width);
             ListItem::new(line).style(status_style(status.summary.state))
         })
         .collect::<Vec<_>>();
@@ -597,6 +593,10 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             status.summary.health_label(),
             status.summary.running_summary()
         )));
+        lines.push(Line::from(format!(
+            "Metrics: {}",
+            project_metrics_line(status.summary.metrics.as_ref())
+        )));
         if let Some(error) = &status.error {
             lines.push(Line::from(format!("API: {error}")));
         }
@@ -619,6 +619,10 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(started_at) = &container.started_at {
                 lines.push(Line::from(format!("  started: {started_at}")));
             }
+            lines.push(Line::from(format!(
+                "  metrics: {}",
+                container_metrics_line(container.metrics.as_ref())
+            )));
         }
     } else {
         lines.push(Line::from(""));
@@ -763,6 +767,167 @@ fn status_style(state: ProjectState) -> Style {
         ProjectState::Error => Style::default().fg(Color::Red),
         ProjectState::Unknown => Style::default().fg(Color::Blue),
     }
+}
+
+fn project_list_line(status: &ProjectStatus, marked: bool, width: usize) -> String {
+    let mark = if marked { "*" } else { " " };
+    let prefix = format!("[{mark}] ");
+    let summary = project_list_summary(status, width, prefix.len());
+    let reserved = prefix.len()
+        + if summary.is_empty() {
+            0
+        } else {
+            summary.len() + 1
+        };
+    let name_width = width.saturating_sub(reserved);
+    let name = truncate_to_width(&status.project.name, name_width);
+    let line = if summary.is_empty() {
+        format!("{prefix}{name}")
+    } else {
+        format!("{prefix}{name} {summary}")
+    };
+    truncate_to_width(&line, width)
+}
+
+fn project_list_summary(status: &ProjectStatus, width: usize, prefix_len: usize) -> String {
+    const MIN_NAME_WIDTH: usize = 4;
+
+    let metrics = status.summary.metrics.as_ref();
+    let running = format!(
+        "{}/{}",
+        status.summary.running_containers, status.summary.total_containers
+    );
+    let cpu = compact_percent(metrics.and_then(|metrics| metrics.cpu_percent));
+    let memory = compact_percent(metrics.and_then(|metrics| metrics.memory_percent));
+    let candidates = [
+        format!(
+            "{} {} {} cpu {} mem {}",
+            status.summary.state_label(),
+            status.summary.health_label(),
+            running,
+            cpu,
+            memory
+        ),
+        format!(
+            "{}{} {} {} {}",
+            project_state_code(status.summary.state),
+            health_code(status.summary.health),
+            running,
+            cpu,
+            memory
+        ),
+        format!("{running} {cpu} {memory}"),
+        format!("{running} {cpu}"),
+        running,
+    ];
+
+    candidates
+        .into_iter()
+        .find(|candidate| width >= prefix_len + candidate.len() + 1 + MIN_NAME_WIDTH)
+        .unwrap_or_else(|| "".to_string())
+}
+
+fn project_state_code(state: ProjectState) -> &'static str {
+    match state {
+        ProjectState::Running => "R",
+        ProjectState::Partial => "P",
+        ProjectState::Stopped => "S",
+        ProjectState::Missing => "M",
+        ProjectState::Error => "E",
+        ProjectState::Unknown => "?",
+    }
+}
+
+fn health_code(health: HealthSummary) -> &'static str {
+    match health {
+        HealthSummary::Healthy => "H",
+        HealthSummary::Unhealthy => "U",
+        HealthSummary::Starting => "S",
+        HealthSummary::NoHealthcheck => "-",
+        HealthSummary::Unknown => "?",
+    }
+}
+
+fn compact_percent(value: Option<f64>) -> String {
+    match value {
+        Some(value) if value.abs() >= 10.0 => format!("{value:.0}%"),
+        Some(value) => format!("{value:.1}%"),
+        None => "-".to_string(),
+    }
+}
+
+fn truncate_to_width(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len <= width {
+        return value.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "~".to_string();
+    }
+
+    let mut truncated = value.chars().take(width - 1).collect::<String>();
+    truncated.push('~');
+    truncated
+}
+
+fn project_metrics_line(metrics: Option<&ProjectMetrics>) -> String {
+    metrics
+        .map(|metrics| {
+            metrics_line(
+                metrics.cpu_percent,
+                metrics.memory_usage_bytes,
+                metrics.memory_limit_bytes,
+                metrics.memory_percent,
+                metrics.network_rx_bytes,
+                metrics.network_tx_bytes,
+                metrics.block_read_bytes,
+                metrics.block_write_bytes,
+                metrics.pids,
+            )
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn container_metrics_line(metrics: Option<&ContainerMetrics>) -> String {
+    metrics
+        .map(|metrics| {
+            metrics_line(
+                metrics.cpu_percent,
+                metrics.memory_usage_bytes,
+                metrics.memory_limit_bytes,
+                metrics.memory_percent,
+                metrics.network_rx_bytes,
+                metrics.network_tx_bytes,
+                metrics.block_read_bytes,
+                metrics.block_write_bytes,
+                metrics.pids,
+            )
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn metrics_line(
+    cpu_percent: Option<f64>,
+    memory_usage_bytes: Option<u64>,
+    memory_limit_bytes: Option<u64>,
+    memory_percent: Option<f64>,
+    network_rx_bytes: u64,
+    network_tx_bytes: u64,
+    block_read_bytes: u64,
+    block_write_bytes: u64,
+    pids: Option<u64>,
+) -> String {
+    format!(
+        "cpu {}  mem {}  net rx/tx {}  block r/w {}  pids {}",
+        docker_api::format_cpu(cpu_percent),
+        docker_api::format_memory(memory_usage_bytes, memory_limit_bytes, memory_percent),
+        docker_api::format_io(network_rx_bytes, network_tx_bytes),
+        docker_api::format_io(block_read_bytes, block_write_bytes),
+        docker_api::format_pids(pids),
+    )
 }
 
 fn focus_style(panel: Focus, current: Focus) -> Style {
