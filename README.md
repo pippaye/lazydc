@@ -209,11 +209,20 @@ Keyboard shortcuts:
 - `s`: stop
 - `r`: restart
 - `d`: remove
+- `D`: remove and delete volumes
+- `x`: delete project files
+- `X`: purge project, volumes, and files
 - `l`: logs
+- `e`: edit the current project's Docker Compose file
+- `E`: edit the current project's `.env`
+- `Alt+e`: edit `.env.global`
+- `c`: open a shell in one of the current project's running containers
 - `?`: open help overlay
 - `q`: quit
 
-If multiple projects are marked, actions run against the marked set in sequence. Otherwise the action targets the currently selected project.
+If multiple projects are marked, actions run against the marked set in sequence. Otherwise the action targets the currently selected project. Edit shortcuts `e` and `E`, and the container shell shortcut `c`, always target only the currently highlighted project; `Alt+e` targets the global `.env.global` file.
+
+The container shell selector uses `j`/`k` or arrow keys to choose a running container, `Enter` to open `docker exec -it`, and `Esc`/`q` to cancel.
 
 New project creation is available from the TUI with `n`. It creates `<compose-dir>/<name>/docker-compose.yaml` with a minimal `services: {}` file, then opens the file in `$VISUAL` or `$EDITOR`. Project names follow Docker Compose project name rules: lowercase letters, digits, `-`, and `_`, starting with a lowercase letter or digit.
 

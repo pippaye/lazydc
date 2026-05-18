@@ -88,6 +88,34 @@ pub fn create_project(compose_dir: &Path, name: &str) -> Result<Project> {
     })
 }
 
+pub fn delete_project(compose_dir: &Path, project: &Project) -> Result<()> {
+    let compose_dir = compose_dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve compose dir {}", compose_dir.display()))?;
+    let project_dir = project
+        .dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project dir {}", project.dir.display()))?;
+
+    if project_dir.parent() != Some(compose_dir.as_path()) {
+        bail!(
+            "refusing to delete project outside compose dir: {}",
+            project.dir.display()
+        );
+    }
+
+    if project_dir.file_name().and_then(|name| name.to_str()) != Some(project.name.as_str()) {
+        bail!(
+            "refusing to delete project with mismatched directory name: {}",
+            project.dir.display()
+        );
+    }
+
+    fs::remove_dir_all(&project_dir)
+        .with_context(|| format!("failed to delete project dir {}", project_dir.display()))?;
+    Ok(())
+}
+
 pub fn validate_project_name(name: &str) -> Result<()> {
     let Some(first) = name.chars().next() else {
         bail!("project name cannot be empty");
@@ -191,5 +219,36 @@ mod tests {
 
         assert!(err.to_string().contains("already exists"));
         assert!(!project_dir.join("docker-compose.yaml").exists());
+    }
+
+    #[test]
+    fn deletes_project_directory() {
+        let dir = tempdir().unwrap();
+        let project = create_project(dir.path(), "app").unwrap();
+        fs::write(project.dir.join("data.txt"), "data\n").unwrap();
+
+        delete_project(dir.path(), &project).unwrap();
+
+        assert!(!project.dir.exists());
+    }
+
+    #[test]
+    fn delete_project_rejects_paths_outside_compose_dir() {
+        let compose_dir = tempdir().unwrap();
+        let outside_dir = tempdir().unwrap();
+        let project_dir = outside_dir.path().join("app");
+        fs::create_dir_all(&project_dir).unwrap();
+        fs::write(project_dir.join("docker-compose.yaml"), "services: {}\n").unwrap();
+        let project = Project {
+            name: "app".to_string(),
+            dir: project_dir.clone(),
+            compose_file: project_dir.join("docker-compose.yaml"),
+            env_file: None,
+        };
+
+        let err = delete_project(compose_dir.path(), &project).unwrap_err();
+
+        assert!(err.to_string().contains("outside compose dir"));
+        assert!(project_dir.exists());
     }
 }
